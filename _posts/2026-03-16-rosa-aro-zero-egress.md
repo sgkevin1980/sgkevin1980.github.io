@@ -1,10 +1,12 @@
 ---
 layout: default
-title: "Zero-Egress Clusters on ROSA HCP and ARO: A Practical Comparison"
+title: "Zero-Egress Clusters on ROSA HCP and ARO"
 date: 2026-03-16
 ---
 
-# Zero-Egress Clusters on ROSA HCP and ARO: A Practical Comparison
+# Zero-Egress Clusters on ROSA HCP and ARO
+
+## A Practical Comparison
 
 **Author:** Kevin Ye
 **Date:** March 2026
@@ -13,25 +15,35 @@ date: 2026-03-16
 
 ## Introduction
 
-Many customers in regulated industries (financial services, government, healthcare) require clusters with no internet-bound egress traffic. This article shares practical learnings from provisioning zero-egress clusters on both **ROSA HCP (AWS)** and **ARO (Azure)**, comparing the architecture, prerequisites, access patterns, and gotchas encountered along the way.
+Many customers in regulated industries (financial services,
+government, healthcare) require clusters with no internet-bound
+egress traffic. This article shares practical learnings from
+provisioning zero-egress clusters on both **ROSA HCP (AWS)**
+and **ARO (Azure)**, comparing the architecture, prerequisites,
+access patterns, and gotchas encountered along the way.
 
-**What is zero-egress?** A zero-egress cluster has no outbound internet connectivity. Worker nodes cannot reach the public internet — all communication with cloud services happens through private endpoints (AWS VPC Endpoints or Azure Private Endpoints/Service Endpoints). This is distinct from a "private cluster" which only makes the API/ingress private but may still allow outbound internet traffic via NAT Gateway or Load Balancer.
+**What is zero-egress?** A zero-egress cluster has no outbound
+internet connectivity. Worker nodes cannot reach the public
+internet — all communication with cloud services happens
+through private endpoints (AWS VPC Endpoints or Azure Service
+Endpoints). This is distinct from a "private cluster" which
+only makes the API/ingress private but may still allow outbound
+internet traffic via NAT Gateway or Load Balancer.
 
 ---
 
 ## Architecture Comparison at a Glance
 
-| Aspect | ROSA HCP (AWS) | ARO (Azure) |
-|--------|----------------|-------------|
-| **Control Plane** | Hosted by Red Hat (not in customer VPC) | Deployed in customer VNet (master subnet) |
-| **Egress Control Mechanism** | No NAT Gateway + VPC Endpoints only | Azure Firewall + UDR (UserDefinedRouting) |
-| **Required Private Endpoints** | S3 (Gateway), STS, ECR API, ECR DKR, CloudWatch Logs, CloudWatch Monitoring | Storage, Container Registry (Service Endpoints on subnets) |
-| **Subnet Requirements** | Private subnets only (no public subnets needed) | Master subnet, Worker subnet, Firewall subnet, Jumphost subnet |
-| **Private API** | `--private` flag (PrivateLink) | `api_server_profile = "Private"` |
-| **Private Ingress** | `--default-ingress-private` flag | `ingress_profile = "Private"` |
-| **Access Method** | VPC Peering + Bastion, or AWS Client VPN | Jumphost with SSH tunnel, Azure P2S VPN, or sshuttle |
-| **Terraform Automation** | Validated pattern with modular network types | Single repo with conditional resources (`count`) |
-| **Approximate Setup Complexity** | Moderate | Higher (Firewall adds cost and config) |
+| Aspect | ROSA HCP | ARO |
+|--------|----------|-----|
+| **Control Plane** | Red Hat hosted | In customer VNet |
+| **Egress Control** | No NAT GW + VPC Endpoints | Azure FW + UDR |
+| **Private Endpoints** | S3, STS, ECR, CloudWatch | Storage, ACR |
+| **Subnets** | Private only | Master, Worker, FW, Jump |
+| **Private API** | `--private` | `api_server_profile=Private` |
+| **Private Ingress** | `--default-ingress-private` | `ingress_profile=Private` |
+| **Access** | Client VPN or VPC Peering | P2S VPN or sshuttle |
+| **Complexity** | Moderate | Higher (FW adds cost) |
 
 ---
 
@@ -39,148 +51,161 @@ Many customers in regulated industries (financial services, government, healthca
 
 ### How It Works
 
-ROSA HCP's zero-egress mode is relatively straightforward because the control plane runs in Red Hat's infrastructure, not in the customer VPC. The customer VPC only contains worker nodes, which communicate with AWS services through VPC Endpoints.
+ROSA HCP's zero-egress mode is straightforward because the
+control plane runs in Red Hat's infrastructure, not in the
+customer VPC. The customer VPC only contains worker nodes,
+which communicate with AWS services through VPC Endpoints.
 
 **Architecture diagram:**
 ```
-                          +--------------------------+
-                          |   Red Hat Managed Infra   |
-                          |  (Control Plane via       |
-                          |   AWS PrivateLink)        |
-                          +------------+-------------+
-                                       | PrivateLink
-                   X  No Internet      | (private connectivity)
-                   X  Gateway / NAT    |
-                                       v
-+==================================================================================+
-|  Customer VPC (10.30.0.0/16) — Private Subnets Only, No NAT GW, No IGW          |
-|                                                                                  |
-|  +---------------------------+  +---------------------------+  +---------------+ |
-|  | Private Subnet AZ-a       |  | Private Subnet AZ-b       |  | Private Sub   | |
-|  | 10.30.0.0/18              |  | 10.30.64.0/18             |  | AZ-c          | |
-|  |                           |  |                           |  | 10.30.128.0/18| |
-|  |  +-------+  +-------+    |  |  +-------+  +-------+    |  |               | |
-|  |  |Worker |  |Worker |    |  |  |Worker |  |Worker |    |  |  +-------+    | |
-|  |  |Node   |  |Node   |    |  |  |Node   |  |Node   |    |  |  |Worker |    | |
-|  |  +-------+  +-------+    |  |  +-------+  +-------+    |  |  +-------+    | |
-|  |                           |  |                           |  |               | |
-|  |  tag: kubernetes.io/      |  |  tag: kubernetes.io/      |  |  tag: k8s.io/ | |
-|  |  role/internal-elb=1      |  |  role/internal-elb=1      |  |  internal-elb | |
-|  +---------------------------+  +---------------------------+  +---------------+ |
-|                                                                                  |
-|  +--VPC Endpoints (private connectivity to AWS services)-------------------------+
-|  |                                                                               |
-|  |  +------------------+   +------------------+   +------------------+           |
-|  |  | S3 (Gateway)     |   | STS (Interface)  |   | ECR API          |           |
-|  |  | FREE             |   | ~$7/mo           |   | (Interface)      |           |
-|  |  +------------------+   +------------------+   | ~$7/mo           |           |
-|  |                                                 +------------------+           |
-|  |  +------------------+   +------------------+   +------------------+           |
-|  |  | ECR DKR          |   | CloudWatch Logs  |   | CloudWatch       |           |
-|  |  | (Interface)      |   | (Interface)      |   | Monitoring       |           |
-|  |  | ~$7/mo           |   | ~$7/mo           |   | (Interface)      |           |
-|  |  +------------------+   +------------------+   +------------------+           |
-|  +-------------------------------------------------------------------------------+
-|                                                                                  |
-|  +--AWS Client VPN Endpoint (optional)-------------------------------------------+
-|  |  Client CIDR: 10.100.0.0/22  |  Split tunnel: enabled                        |
-|  +-------------------------------+----------------------------------------------+
-|                 ^                                                                |
-+==================================================================================+
-                  |
-                  | OpenVPN tunnel
-                  |
-          +-------+-------+
-          |   Laptop       |
-          |   (Developer)  |
-          +----------------+
+     +------------------------+
+     | Red Hat Managed Infra  |
+     | (Control Plane via     |
+     |  AWS PrivateLink)      |
+     +-----------+------------+
+                 | PrivateLink
+  X No IGW      | (private)
+  X No NAT GW   |
+                 v
++==========================================+
+| Customer VPC (10.0.0.0/16)               |
+| Private Subnets Only                     |
+|                                          |
+| +------------+ +------------+ +--------+ |
+| | Subnet AZ-a| | Subnet AZ-b| | Sub    | |
+| | 10.0.0.0/18| | 10.0.64/18 | | AZ-c   | |
+| |            | |            | |        | |
+| | +--------+ | | +--------+ | |+------+| |
+| | |Worker  | | | |Worker  | | ||Worker|| |
+| | |Node    | | | |Node    | | |+------+| |
+| | +--------+ | | +--------+ | |        | |
+| |            | |            | |        | |
+| | tag:       | | tag:       | | tag:   | |
+| | internal-  | | internal-  | | int-   | |
+| | elb=1      | | elb=1      | | elb=1  | |
+| +------------+ +------------+ +--------+ |
+|                                          |
+| +-- VPC Endpoints ----------------------+|
+| |                                       ||
+| | +-----------+ +-----------+ +-------+ ||
+| | |S3 Gateway | |STS Intf   | |ECR API| ||
+| | |FREE       | |~$7/mo     | |~$7/mo | ||
+| | +-----------+ +-----------+ +-------+ ||
+| |                                       ||
+| | +-----------+ +-----------+ +-------+ ||
+| | |ECR DKR   | |CW Logs    | |CW Mon | ||
+| | |~$7/mo    | |~$7/mo     | |~$7/mo | ||
+| | +-----------+ +-----------+ +-------+ ||
+| +---------------------------------------+|
+|                                          |
+| +-- AWS Client VPN (optional) ----------+|
+| | Client CIDR: 10.100.0.0/22           ||
+| | Split tunnel: enabled                ||
+| +--+------------------------------------+|
+|    ^                                     |
++====|=====================================+
+     |
+     | OpenVPN tunnel
+     |
+ +---+----------+
+ | Laptop       |
+ | (Developer)  |
+ +--------------+
 ```
 
 ### Prerequisites
 
-1. **VPC with private subnets only** — no public subnets, no NAT Gateway
+1. **VPC with private subnets only** — no public
+   subnets, no NAT Gateway
 2. **VPC Endpoints** (minimum required):
 
-   | Service | Type | Cost |
-   |---------|------|------|
-   | `com.amazonaws.<region>.s3` | Gateway | Free |
-   | `com.amazonaws.<region>.sts` | Interface | ~$7/mo |
-   | `com.amazonaws.<region>.ecr.api` | Interface | ~$7/mo |
-   | `com.amazonaws.<region>.ecr.dkr` | Interface | ~$7/mo |
+| Service | Type | Cost |
+|---------|------|------|
+| `s3` | Gateway | Free |
+| `sts` | Interface | ~$7/mo |
+| `ecr.api` | Interface | ~$7/mo |
+| `ecr.dkr` | Interface | ~$7/mo |
 
-   Optional but recommended for observability:
-   | Service | Type | Purpose |
-   |---------|------|---------|
-   | `com.amazonaws.<region>.logs` | Interface | CloudWatch Logs |
-   | `com.amazonaws.<region>.monitoring` | Interface | CloudWatch Monitoring |
+Optional for observability:
 
-3. **Subnet tagging**: All private subnets must have `kubernetes.io/role/internal-elb = 1`
-4. **Security group for VPC endpoints**: Allow HTTPS (443) inbound from VPC CIDR
+| Service | Type | Purpose |
+|---------|------|---------|
+| `logs` | Interface | CloudWatch Logs |
+| `monitoring` | Interface | CloudWatch Mon |
 
-> **Important**: `elasticloadbalancing` and `ec2` endpoints are NOT required for ROSA HCP — the control plane runs in Red Hat's infrastructure.
+3. **Subnet tagging**:
+   `kubernetes.io/role/internal-elb = 1`
+4. **VPC Endpoint SG**: Allow HTTPS (443) from VPC CIDR
+
+> **Important**: `elasticloadbalancing` and `ec2` endpoints
+> are NOT required for ROSA HCP — the control plane runs
+> in Red Hat's infrastructure.
 
 ### Cluster Creation
 
-The critical flags are `--private` (API via PrivateLink) and `--default-ingress-private` (internal load balancer for ingress):
+The critical flags are `--private` (API via PrivateLink)
+and `--default-ingress-private` (internal LB for ingress):
 
 ```bash
-rosa create cluster --cluster-name=kev-ze1 \
-     --mode=auto --hosted-cp \
-     --operator-roles-prefix kev-ze1 \
-     --oidc-config-id "<oidc-config-id>" \
-     --subnet-ids="<private-subnet-1>,<private-subnet-2>,<private-subnet-3>" \
-     --region ap-southeast-1 \
-     --machine-cidr 10.30.0.0/16 \
-     --private \
-     --default-ingress-private
+rosa create cluster \
+  --cluster-name=my-ze-cluster \
+  --mode=auto --hosted-cp \
+  --operator-roles-prefix my-ze-cluster \
+  --oidc-config-id "<oidc-config-id>" \
+  --subnet-ids="<subnet-1>,<subnet-2>,<subnet-3>" \
+  --region <region> \
+  --machine-cidr 10.0.0.0/16 \
+  --private \
+  --default-ingress-private
 ```
 
 ### Terraform Approach (Validated Pattern)
 
 ```
-  Repo: latest-validated-pattern
-  ===============================
+Repo structure:
+===============
 
-  latest-validated-pattern/
-  +-- Makefile                        # Root: make cluster.<name>.<op>
-  +-- Makefile.cluster                # Cluster operations (init/plan/apply/destroy)
-  +-- terraform/                      # Root Terraform config
-  |   +-- 10-main.tf                  # Calls modules based on network_type
-  |   +-- 01-variables.tf
-  |   +-- 90-outputs.tf
-  +-- modules/
-  |   +-- infrastructure/
-  |       +-- network-private/        # <-- Used for zero-egress
-  |       |   +-- 10-main.tf          #     VPC, private subnets, VPC endpoints,
-  |       |                           #     security groups, route tables
-  |       +-- network-public/         #     (not used for zero-egress)
-  +-- clusters/
-  |   +-- egress-zero/                # <-- Cluster-specific config
-  |   |   +-- terraform.tfvars        #     network_type="private", zero_egress=true
-  |   +-- public/
-  |       +-- terraform.tfvars
-  +-- scripts/
-      +-- cluster/                    # init, plan, apply, destroy scripts
-      +-- vpn/                        # VPN start/stop/status
-      +-- tunnel/                     # sshuttle start/stop (deprecated)
+validated-pattern/
++-- Makefile            # make cluster.<name>.<op>
++-- Makefile.cluster    # Cluster operations
++-- terraform/          # Root Terraform config
+|   +-- 10-main.tf      # Modules by network_type
+|   +-- 01-variables.tf
+|   +-- 90-outputs.tf
++-- modules/
+|   +-- infrastructure/
+|       +-- network-private/  # Zero-egress
+|       |   +-- 10-main.tf    # VPC, subnets,
+|       |                     # endpoints, SGs
+|       +-- network-public/   # (not used)
++-- clusters/
+|   +-- egress-zero/          # Cluster config
+|   |   +-- terraform.tfvars
+|   +-- public/
+|       +-- terraform.tfvars
++-- scripts/
+    +-- cluster/    # init/plan/apply/destroy
+    +-- vpn/        # VPN start/stop/status
+    +-- tunnel/     # sshuttle (deprecated)
 ```
 
-The validated pattern uses a modular approach with separate network types:
+The validated pattern uses a modular approach:
 
-- `network_type = "private"` — creates only private subnets (no public subnets)
-- `zero_egress = true` — enables zero-egress mode (no NAT Gateway, strict security groups)
-- `private = true` — makes API endpoint private via PrivateLink
+- `network_type = "private"` — private subnets only
+- `zero_egress = true` — no NAT GW, strict SGs
+- `private = true` — API via PrivateLink
 
-Key Terraform configuration (`terraform.tfvars`):
+Key Terraform configuration:
+
 ```hcl
-cluster_name = "kev-ze1"
+cluster_name = "my-ze-cluster"
 network_type = "private"
 zero_egress  = true
 private      = true
-region       = "ap-southeast-1"
-vpc_cidr     = "10.30.0.0/16"
+region       = "<region>"
+vpc_cidr     = "10.0.0.0/16"
 
-# Access: AWS Client VPN (preferred over bastion)
+# Access: AWS Client VPN
 enable_client_vpn     = true
 vpn_client_cidr_block = "10.100.0.0/22"
 vpn_split_tunnel      = true
@@ -188,51 +213,47 @@ vpn_split_tunnel      = true
 
 The network module automatically:
 - Creates VPC with private subnets only
-- Provisions all required VPC Endpoints (S3, STS, ECR, CloudWatch)
-- Applies strict security groups (egress limited to VPC CIDR on port 443 and DNS)
+- Provisions all required VPC Endpoints
+- Applies strict security groups
 - Tags subnets for internal ELB
 
-### Step-by-Step: Deploy ROSA HCP Zero-Egress with Terraform
-
-The `latest-validated-pattern` repo provides a modular Terraform setup with a cluster-based directory structure. Each cluster has its own `terraform.tfvars` under `clusters/<cluster-name>/`.
+### Step-by-Step: Deploy with Terraform
 
 #### Prerequisites
 
 - AWS CLI configured and authenticated
-- ROSA CLI installed and logged in (`rosa login`)
+- ROSA CLI installed (`rosa login`)
 - Terraform CLI (>= 1.x)
-- `oc` CLI (for cluster access after deployment)
+- `oc` CLI for cluster access
 
-#### Step 1: Clone the repo and review the cluster config
+#### Step 1: Review the cluster config
 
 ```bash
-cd latest-validated-pattern
+cd validated-pattern
 ls clusters/
-# Available clusters: egress-zero, public, etc.
+# Available: egress-zero, public, etc.
 ```
 
-Review or create a cluster config directory (e.g., `clusters/egress-zero/`) with a `terraform.tfvars`:
+Example `clusters/egress-zero/terraform.tfvars`:
 
 ```hcl
-# clusters/egress-zero/terraform.tfvars
-
-cluster_name = "kev-ze1"
+cluster_name = "my-ze-cluster"
 
 # Network Configuration
-network_type = "private"    # Private subnets only for zero-egress
-zero_egress  = true         # No internet egress, only VPC endpoints
-private      = true         # Private API endpoint (PrivateLink)
-region       = "ap-southeast-1"
-vpc_cidr     = "10.30.0.0/16"
+network_type = "private"
+zero_egress  = true
+private      = true
+region       = "<region>"
+vpc_cidr     = "10.0.0.0/16"
 
-# AWS Client VPN (recommended for zero-egress access)
+# AWS Client VPN
 enable_client_vpn         = true
-vpn_client_cidr_block     = "10.100.0.0/22"   # Must not overlap with vpc_cidr
+vpn_client_cidr_block     = "10.100.0.0/22"
 vpn_split_tunnel          = true
 vpn_session_timeout_hours = 12
 
 # Cluster Topology
-multi_az              = true         # Multi-AZ for HA
+multi_az              = true
 default_instance_type = "m5.xlarge"
 openshift_version     = "4.19.24"
 
@@ -242,13 +263,11 @@ pod_cidr     = "10.128.0.0/14"
 host_prefix  = 23
 ```
 
-#### Step 2: Initialize the infrastructure
+#### Step 2: Initialize
 
 ```bash
 make cluster.egress-zero.init
 ```
-
-This runs `terraform init` in the `terraform/` directory using the cluster-specific variables.
 
 #### Step 3: Plan and review
 
@@ -256,50 +275,46 @@ This runs `terraform init` in the `terraform/` directory using the cluster-speci
 make cluster.egress-zero.plan
 ```
 
-Review the plan output. For a zero-egress cluster, you should see:
-- VPC with private subnets only (no public subnets, no NAT Gateway)
-- VPC Endpoints: S3 (Gateway), STS, ECR API, ECR DKR, CloudWatch Logs, CloudWatch Monitoring
-- Security groups with restricted egress (HTTPS to VPC CIDR only)
+Review the plan — you should see:
+- VPC with private subnets only
+- VPC Endpoints (S3, STS, ECR, CloudWatch)
+- Security groups with restricted egress
 - ROSA HCP cluster with `private = true`
 - AWS Client VPN endpoint (if enabled)
 
-#### Step 4: Apply (create the cluster)
+#### Step 4: Apply
 
 ```bash
 make cluster.egress-zero.apply
 ```
 
-This provisions all infrastructure and creates the ROSA HCP cluster. Cluster creation typically takes 15-25 minutes.
+Cluster creation takes ~15-25 minutes.
 
-#### Step 5: Connect via VPN and access the cluster
+#### Step 5: Connect via VPN
 
 ```bash
-# Show VPN config and connection instructions
+# Show VPN config
 make cluster.egress-zero.vpn-config
 
-# Start VPN tunnel (uses OpenVPN)
+# Start VPN tunnel
 make cluster.egress-zero.vpn-start
 
-# Verify VPN is connected
+# Verify VPN
 make cluster.egress-zero.vpn-status
 ```
 
-#### Step 6: Login to the cluster
+#### Step 6: Login
 
 ```bash
-# Show API and console URLs
+# Show endpoints and credentials
 make cluster.egress-zero.show-endpoints
-
-# Show admin credentials
 make cluster.egress-zero.show-credentials
 
-# Login via oc CLI (auto-starts VPN if needed)
+# Login via oc CLI
 make cluster.egress-zero.login
 ```
 
 #### Step 7: (Optional) Bootstrap GitOps
-
-If `enable_gitops_bootstrap = true` is set in tfvars:
 
 ```bash
 make cluster.egress-zero.bootstrap
@@ -308,68 +323,78 @@ make cluster.egress-zero.bootstrap
 #### Cleanup
 
 ```bash
-# Sleep the cluster (preserves DNS, IAM, secrets — can wake later)
+# Sleep (preserves DNS, IAM, secrets)
 make cluster.egress-zero.sleep
 
-# Or fully destroy all resources
+# Or fully destroy
 make cluster.egress-zero.destroy
 ```
 
 ### Zero-Egress Security Groups
 
-In zero-egress mode, security groups are locked down:
+In zero-egress mode, SGs are locked down:
 
 **VPC Endpoint SG:**
 - Inbound: HTTPS (443) from VPC CIDR
-- Outbound: None (no egress rules)
+- Outbound: None
 
 **Worker Node SG:**
 - Inbound: All traffic from VPC CIDR
-- Outbound: HTTPS (443) to VPC CIDR only, DNS (53 UDP/TCP) to VPC CIDR only
+- Outbound: HTTPS (443) to VPC CIDR only,
+  DNS (53 UDP/TCP) to VPC CIDR only
 
 ### Access Patterns
 
-Since the cluster has no public endpoints, access requires one of:
+Since the cluster has no public endpoints:
 
-1. **AWS Client VPN** (recommended) — connect your laptop directly to the VPC
-2. **VPC Peering + Bastion** — peer a bastion VPC to the ROSA VPC, then SSH tunnel or use a Windows bastion with a browser
-3. **Route53 Private Hosted Zone association** — associate the cluster's private hosted zones with the bastion/VPN VPC for DNS resolution
+1. **AWS Client VPN** (recommended)
+2. **VPC Peering + Bastion**
+3. **Route53 Private Hosted Zone association**
 
 ```
-  Option 1: AWS Client VPN (Recommended)
-  =======================================
+Option 1: AWS Client VPN (Recommended)
+=======================================
 
-  +----------+    OpenVPN     +------------------+    private    +----------------+
-  |  Laptop  | ------------> | AWS Client VPN   | -----------> | ROSA HCP       |
-  |          |  split tunnel  | Endpoint in VPC  |   subnet     | Worker Nodes   |
-  +----------+                +------------------+              | API (Private)  |
-                                                                | Apps (Private) |
-                                                                +----------------+
++--------+  OpenVPN  +-------------+  private  +-------+
+| Laptop |--------->| Client VPN  |---------->| ROSA  |
+|        | split    | Endpoint    |  subnet   | HCP   |
++--------+ tunnel   +-------------+           | API   |
+                                              | Apps  |
+                                              +-------+
 
-  Option 2: VPC Peering + Bastion
-  ================================
+Option 2: VPC Peering + Bastion
+================================
 
-                  +---------------------+         VPC Peering        +------------------+
-  +----------+   | Bastion VPC          |  <=====================>  | ROSA VPC         |
-  |  Laptop  |-->| (172.168.0.0/16)     |     Route tables +        | (10.30.0.0/16)   |
-  |   RDP/   |   |  +----------------+  |     Security groups +     |  Worker Nodes    |
-  |   SSH    |   |  | Windows/Linux  |  |     Route53 PHZ assoc     |  API (Private)   |
-  +----------+   |  | Bastion Host   |  |                           |  Apps (Private)  |
-                  |  +----------------+  |                           +------------------+
-                  +---------------------+
++--------+   +--------------+  VPC Peering  +-------+
+| Laptop |-->| Bastion VPC  |<============>| ROSA  |
+| RDP/   |   | +----------+ | Route tables | VPC   |
+| SSH    |   | | Bastion  | | SG rules +   | API   |
++--------+   | | Host     | | R53 PHZ      | Apps  |
+             | +----------+ |              +-------+
+             +--------------+
 ```
 
 ### Gotchas and Lessons Learned
 
-1. **Must use BOTH `--private` AND `--default-ingress-private`**: Using only `--private` will cause the ingress to attempt creating a public-facing load balancer, which fails in a private-only subnet setup with "Must have at least one public subnet."
+1. **Must use BOTH `--private` AND
+   `--default-ingress-private`**: Using only `--private`
+   causes ingress to attempt a public LB, which fails
+   with "Must have at least one public subnet."
 
-2. **Subnet tagging is critical**: Without `kubernetes.io/role/internal-elb=1` on private subnets, the internal load balancer for ingress will be stuck in `<pending>` state.
+2. **Subnet tagging is critical**: Without
+   `kubernetes.io/role/internal-elb=1`, the internal
+   LB for ingress stays in `<pending>` state.
 
-3. **DNS resolution across VPC peering**: If using a bastion in a separate VPC, you must associate the ROSA cluster's Route53 private hosted zones with the bastion VPC. Otherwise, `api.<cluster>.<domain>` and `*.apps.<cluster>.<domain>` won't resolve.
+3. **DNS across VPC peering**: Associate the ROSA
+   cluster's Route53 private hosted zones with the
+   bastion VPC for DNS resolution.
 
-4. **Security group rules for peered VPC**: After VPC peering, you need to add ingress rules to both the VPC endpoint SG and the default ROSA SG to allow traffic from the bastion VPC CIDR.
+4. **SG rules for peered VPC**: Add ingress rules to
+   both VPC endpoint SG and default ROSA SG for
+   bastion VPC CIDR.
 
-5. **VPC Endpoints cost**: Each Interface endpoint costs ~$7-10/month. With 4-6 endpoints, budget ~$30-60/month for endpoints alone.
+5. **VPC Endpoints cost**: ~$7-10/mo each. Budget
+   ~$30-60/mo for 4-6 endpoints.
 
 ---
 
@@ -378,373 +403,383 @@ Since the cluster has no public endpoints, access requires one of:
 ### How It Works
 
 ARO's zero-egress approach is more involved because:
-- The control plane runs **inside the customer VNet** (unlike ROSA HCP)
-- Egress restriction uses **Azure Firewall** with User Defined Routing (UDR)
-- The firewall needs explicit application rules for Red Hat and Azure service FQDNs
+- Control plane runs **inside the customer VNet**
+- Egress restriction uses **Azure Firewall** + UDR
+- Firewall needs explicit FQDN rules
 
 **Architecture diagram:**
 ```
-                                    Internet
-                                       ^
-                                       | (only firewall has public IP;
-                                       |  cluster nodes cannot reach internet
-                                       |  unless firewall FQDN rules allow it)
-                                       |
-+======================================|==========================================+
-|  Azure VNet (10.0.0.0/20)            |                                          |
-|                                       |                                          |
-|  +-----------------------------------+--------------------------------------+   |
-|  | AzureFirewallSubnet (10.0.6.0/23)                                        |   |
-|  |                                                                          |   |
-|  |  +-----------------------------+                                         |   |
-|  |  | Azure Firewall              |   Application Rules:                    |   |
-|  |  | Public IP: x.x.x.x         |   - *.azurecr.io, *.azure.com          |   |
-|  |  | Private IP: 10.0.6.4       <----  - registry.redhat.io, *.quay.io    |   |
-|  |  +-----------------------------+   - *.openshift.com, *.redhat.com      |   |
-|  |         ^                          - login.microsoftonline.com           |   |
-|  +---------|-----------+-------------+--------------------------------------+   |
-|            |           |             |                                          |
-|     UDR: 0.0.0.0/0    |      UDR: 0.0.0.0/0                                    |
-|     -> 10.0.6.4       |      -> 10.0.6.4                                        |
-|            |           |             |                                          |
-|  +---------+---------+ | +-----------+----------+                               |
-|  | Master Subnet     | | | Worker Subnet         |                              |
-|  | 10.0.0.0/23       | | | 10.0.2.0/23           |                              |
-|  |                   | | |                        |                              |
-|  | +-----+ +-----+  | | | +------+ +------+     |   +------------------------+ |
-|  | |CP   | |CP   |  | | | |Worker| |Worker|     |   | Jumphost Subnet        | |
-|  | |Node | |Node |  | | | |Node  | |Node  |     |   | 10.0.4.0/23            | |
-|  | +-----+ +-----+  | | | +------+ +------+     |   |                        | |
-|  | +-----+          | | | +------+               |   | +--------------------+ | |
-|  | |CP   |          | | | |Worker|               |   | | Jumphost VM        | | |
-|  | |Node |          | | | |Node  |               |   | | Public IP: y.y.y.y | | |
-|  | +-----+          | | | +------+               |   | | SSH / sshuttle     | | |
-|  |                   | | |                        |   | +--------------------+ | |
-|  | NSG + Service     | | | NSG + Service          |   +------------------------+ |
-|  | Endpoints:        | | | Endpoints:             |                              |
-|  | Storage, ACR      | | | Storage, ACR           |                              |
-|  +-------------------+ | +------------------------+                              |
-|                        |                                                         |
-|  +---------------------+-------------------------------------------------------+|
-|  | (Optional) Private Endpoint Subnet (10.0.8.0/23)                             ||
-|  |  +-------------------+                                                       ||
-|  |  | ACR Private       |   Private DNS Zone: *.azurecr.io                      ||
-|  |  | Endpoint          |                                                       ||
-|  |  +-------------------+                                                       ||
-|  +------------------------------------------------------------------------------+|
-|                                                                                  |
-|  +---(Optional) GatewaySubnet (10.0.0.64/27)------------------------------------+
-|  |  +-------------------+                                                       |
-|  |  | VPN Gateway       |  P2S VPN: OpenVPN protocol                            |
-|  |  | (VpnGw1 SKU)      |  Client pool: 172.16.0.0/24                           |
-|  |  +-------------------+  Root CA + Client cert (EKU: clientAuth required!)     |
-|  +------+----------------------------------------------------------------------- +
-|         ^                                                                        |
-+=========|========================================================================+
-          |
-          | OpenVPN / Tunnelblick
-          |
-  +-------+-------+
-  |   Laptop       |
-  |   (Developer)  |
-  +----------------+
+                 Internet
+                    ^
+                    | (only FW has public IP;
+                    |  nodes can't reach internet
+                    |  unless FW rules allow it)
+                    |
++===================|======================+
+| Azure VNet (10.0.0.0/20)                |
+|                   |                      |
+| +-----------------+-------------------+ |
+| | AzureFirewallSubnet (10.0.6.0/23)   | |
+| |                                     | |
+| | +---------------------+            | |
+| | | Azure Firewall      | App Rules: | |
+| | | Pub IP: x.x.x.x     | *.azurecr  | |
+| | | Priv IP: 10.0.6.4  <-- *.quay.io | |
+| | +---------------------+ *.redhat   | |
+| |        ^                            | |
+| +--------|---+------------------------+ |
+|          |   |                          |
+|   UDR:0/0   | UDR:0/0                  |
+|   ->10.0.6.4| ->10.0.6.4               |
+|          |   |                          |
+| +--------++ | +----------+ +---------+ |
+| | Master  | | | Worker   | | Jumphost| |
+| | Subnet  | | | Subnet   | | Subnet  | |
+| | 10.0.0  | | | 10.0.2   | | 10.0.4  | |
+| | .0/23   | | | .0/23    | | .0/23   | |
+| |         | | |          | |         | |
+| | +--+--+ | | | +--+--+ | | +-----+ | |
+| | |CP|CP| | | | |WK|WK| | | |Jump | | |
+| | +--+--+ | | | +--+--+ | | |host | | |
+| | +--+    | | | +--+    | | |VM   | | |
+| | |CP|    | | | |WK|    | | +-----+ | |
+| | +--+    | | | +--+    | |         | |
+| |         | | |          | |         | |
+| | SvcEndpt| | | SvcEndpt | |         | |
+| | Stor,ACR| | | Stor,ACR | |         | |
+| +---------+ | +----------+ +---------+ |
+|             |                           |
+| +-----------+--------------------------+|
+| | (Optional) PE Subnet (10.0.8.0/23)  ||
+| | +-------------+                     ||
+| | | ACR Private |  DNS: *.azurecr.io  ||
+| | | Endpoint    |                     ||
+| | +-------------+                     ||
+| +--------------------------------------+|
+|                                         |
+| +-- GatewaySubnet (10.0.0.64/27) ------+|
+| | +-------------+                      ||
+| | | VPN Gateway | P2S VPN: OpenVPN     ||
+| | | (VpnGw1)    | Pool: 172.16.0.0/24  ||
+| | +-------------+ EKU: clientAuth!     ||
+| +--+-----------------------------------+|
+|    ^                                    |
++=====|====================================+
+      |
+      | OpenVPN / Tunnelblick
+      |
+  +---+---------+
+  | Laptop      |
+  | (Developer) |
+  +-------------+
 ```
 
 ### Prerequisites
 
-1. **Azure Firewall** with a public IP (required for the firewall itself, but cluster traffic is routed through it)
-2. **Route Table** with UDR: `0.0.0.0/0 -> VirtualAppliance (Firewall private IP)`
-3. **Firewall Application Rules** for required FQDNs
-4. **Service Endpoints** on subnets: `Microsoft.Storage`, `Microsoft.ContainerRegistry`
-5. **Cluster creation flag**: `outbound_type = "UserDefinedRouting"`
+1. **Azure Firewall** with a public IP
+2. **Route Table** with UDR:
+   `0.0.0.0/0 -> VirtualAppliance (FW IP)`
+3. **Firewall Application Rules** for FQDNs
+4. **Service Endpoints** on subnets:
+   `Microsoft.Storage`, `Microsoft.ContainerRegistry`
+5. **Cluster flag**:
+   `outbound_type = "UserDefinedRouting"`
 
 ### Firewall Rules Required
 
-ARO requires specific FQDN-based firewall rules to function:
-
 **Azure-specific:**
-- `*.azurecr.io`, `*.azure.com`, `login.microsoftonline.com`
-- `*.windows.net`, `dc.services.visualstudio.com`
-- `*.ods.opinsights.azure.com`, `*.oms.opinsights.azure.com`, `*.monitoring.azure.com`
+- `*.azurecr.io`, `*.azure.com`
+- `login.microsoftonline.com`
+- `*.windows.net`
+- `*.ods.opinsights.azure.com`
+- `*.oms.opinsights.azure.com`
+- `*.monitoring.azure.com`
 
 **Red Hat / OpenShift:**
-- `registry.redhat.io`, `*.registry.redhat.io`, `registry.access.redhat.com`
-- `*.quay.io`, `quay.io`, `cdn.quay.io`, `cdn01-03.quay.io`
-- `cert-api.access.redhat.com`, `api.openshift.com`, `api.access.redhat.com`
-- `mirror.openshift.com`, `sso.redhat.com`
-- `*.redhat.com`, `*.openshift.com`, `*.microsoft.com`
+- `registry.redhat.io`, `*.registry.redhat.io`
+- `registry.access.redhat.com`
+- `*.quay.io`, `quay.io`, `cdn.quay.io`
+- `cert-api.access.redhat.com`
+- `api.openshift.com`, `mirror.openshift.com`
+- `sso.redhat.com`
+- `*.redhat.com`, `*.openshift.com`
 
 **Docker (if needed):**
-- `*cloudflare.docker.com`, `*registry-1.docker.io`, `auth.docker.io`
+- `*cloudflare.docker.com`
+- `*registry-1.docker.io`
+- `auth.docker.io`
 
 ### Terraform Approach
 
 ```
-  Repo: aroze
-  ============
+Repo structure:
+===============
 
-  aroze/
-  +-- Makefile                        # make create-zero-egress / destroy
-  +-- 00-terraform.tf                 # Provider config (azurerm ~>4.21.1)
-  +-- 01-variables.tf                 # All variables (cluster, network, egress)
-  +-- 02-locals.tf                    # Computed locals
-  +-- 03-data.tf                      # Data sources (existing RG, VNet, subnets)
-  +-- 10-network.tf                   # NSGs (always created)
-  +-- 11-egress.tf                    # Azure Firewall + UDR + rules
-  |                                   #   (conditional: restrict_egress_traffic)
-  +-- 20-iam.tf                       # Service principals / managed identities
-  +-- 30-jumphost.tf                  # Bastion VM (conditional: private API/ingress)
-  +-- 40-acr.tf                       # Private ACR (conditional: acr_private)
-  +-- 50-cluster.tf                   # ARO cluster resource
-  +-- 90-outputs.tf                   # API URL, console URL, credentials
-  +-- modules/
-  |   +-- aro-permissions/            # Vendored SP/MI permission module (v0.2.1)
-  +-- terraform.tfvars                # Your cluster-specific config
+terraform-aro/
++-- Makefile          # make create-zero-egress
++-- 00-terraform.tf   # Provider config
++-- 01-variables.tf   # All variables
++-- 02-locals.tf      # Computed locals
++-- 03-data.tf        # Existing RG, VNet
++-- 10-network.tf     # NSGs
++-- 11-egress.tf      # FW + UDR (conditional)
++-- 20-iam.tf         # SP / managed identities
++-- 30-jumphost.tf    # Bastion (conditional)
++-- 40-acr.tf         # Private ACR (conditional)
++-- 50-cluster.tf     # ARO cluster
++-- 90-outputs.tf     # URLs, credentials
++-- modules/
+|   +-- aro-permissions/  # SP/MI module
++-- terraform.tfvars      # Your config
 ```
 
-ARO uses conditional resources controlled by variables:
+ARO uses conditional resources:
 
 ```hcl
-# Enable private cluster with egress restriction
-api_server_profile       = "Private"
-ingress_profile          = "Private"
-restrict_egress_traffic  = true   # Creates Azure Firewall + UDR
+api_server_profile      = "Private"
+ingress_profile         = "Private"
+restrict_egress_traffic = true
 ```
 
 When `restrict_egress_traffic = true`:
-- Azure Firewall and its subnet are created
-- Route table with UDR is created and associated with master/worker subnets
-- Application rule collections are added for Azure, Red Hat, and Docker FQDNs
-- A jumphost VM is automatically created for cluster access
+- Azure Firewall + subnet created
+- Route table with UDR created
+- Application rules added for FQDNs
+- Jumphost VM auto-created
 
-### Step-by-Step: Deploy ARO Zero-Egress with Terraform
-
-The `aroze` repo uses a single Terraform root with conditional resources. It expects **existing Azure resources** (resource group, VNet, subnets) and layers the ARO cluster, firewall, and jumphost on top.
+### Step-by-Step: Deploy with Terraform
 
 #### Prerequisites
 
 - Azure CLI (`az`) installed and logged in
 - Terraform CLI (>= 1.12)
-- `oc` CLI (for cluster access after deployment)
-- An existing Azure resource group, VNet, and subnets (master + worker)
-- Red Hat pull secret (download from [console.redhat.com](https://console.redhat.com/openshift/install/pull-secret))
+- `oc` CLI for cluster access
+- Existing Azure RG, VNet, and subnets
+- Red Hat pull secret
 
 #### Step 1: Prepare the existing network
 
-Before running Terraform, add required service endpoints to the existing subnets. The Makefile has a target for this:
-
 ```bash
-cd aroze
+cd terraform-aro
 
-# This adds Microsoft.Storage and Microsoft.ContainerRegistry service endpoints
-# to both master and worker subnets
+# Add service endpoints to subnets
 make prep-subnets
 ```
 
 Or manually:
 
 ```bash
-az network vnet subnet update -g kevin-rg --vnet-name kev-ne1-vnet \
-  -n MASTER-SUBNET --service-endpoints Microsoft.Storage Microsoft.ContainerRegistry
+az network vnet subnet update \
+  -g <resource-group> \
+  --vnet-name <vnet-name> \
+  -n <master-subnet> \
+  --service-endpoints \
+  Microsoft.Storage \
+  Microsoft.ContainerRegistry
 
-az network vnet subnet update -g kevin-rg --vnet-name kev-ne1-vnet \
-  -n WORKER-SUBNET --service-endpoints Microsoft.Storage Microsoft.ContainerRegistry
+az network vnet subnet update \
+  -g <resource-group> \
+  --vnet-name <vnet-name> \
+  -n <worker-subnet> \
+  --service-endpoints \
+  Microsoft.Storage \
+  Microsoft.ContainerRegistry
 ```
 
-#### Step 2: Create the terraform.tfvars
+#### Step 2: Create terraform.tfvars
 
 ```bash
-# Copy the example file
 make tfvars
-
-# Then edit terraform.tfvars with your values
+# Then edit terraform.tfvars
 ```
 
 Key variables for zero-egress:
 
 ```hcl
-# terraform.tfvars
-
-# Existing Azure resources (must exist before running Terraform)
-resource_group_name       = "kevin-rg"
-vnet_name                 = "kev-ne1-vnet"
-control_plane_subnet_name = "MASTER-SUBNET"
-machine_subnet_name       = "WORKER-SUBNET"
+# Existing Azure resources
+resource_group_name       = "<resource-group>"
+vnet_name                 = "<vnet-name>"
+control_plane_subnet_name = "<master-subnet>"
+machine_subnet_name       = "<worker-subnet>"
 
 # Cluster configuration
-cluster_name    = "kev-aro-ze"
-location        = "southeastasia"
-subscription_id = "<your-azure-subscription-id>"
+cluster_name    = "my-aro-ze"
+location        = "<azure-region>"
+subscription_id = "<subscription-id>"
 
-# Zero-egress settings — all four of these are required together
+# Zero-egress (all four required together)
 api_server_profile      = "Private"
 ingress_profile         = "Private"
-restrict_egress_traffic = true                # Creates Azure Firewall + UDR
-outbound_type           = "UserDefinedRouting" # Routes egress through firewall
+restrict_egress_traffic = true
+outbound_type           = "UserDefinedRouting"
 
-# Firewall subnet CIDR (must fit in your existing VNet address space)
-aro_firewall_subnet_cidr_block = "10.0.0.128/26"
+# Firewall subnet CIDR
+aro_firewall_subnet_cidr_block = "10.0.6.0/23"
 
-# Access method: jumphost or VPN (set false if using Azure P2S VPN)
+# Access method
 create_jumphost = false
 
-# Pull secret for Red Hat registry access (required for OperatorHub)
+# Pull secret
 pull_secret_path = "~/Downloads/pull-secret.txt"
 ```
 
-> **Important**: The four zero-egress variables (`api_server_profile`, `ingress_profile`, `restrict_egress_traffic`, `outbound_type`) must all be set together. Missing any one of them will result in a broken configuration.
+> **Important**: The four zero-egress variables must
+> all be set together. Missing any one results in a
+> broken configuration.
 
 #### Step 3: Initialize and deploy
 
 ```bash
-# Option A: Use the zero-egress make target (includes prep-subnets + init)
+# All-in-one (prep-subnets + init + plan + apply)
 make create-zero-egress
 ```
-
-This runs:
-1. `make prep-subnets` — adds service endpoints to existing subnets
-2. `terraform init -upgrade`
-3. `terraform plan -out aro.plan`
-4. `terraform apply aro.plan`
 
 Or step by step:
 
 ```bash
-# Initialize
 make init
-
-# Plan (review the output carefully)
 terraform plan -out aro.plan
-
-# Apply
 terraform apply aro.plan
 ```
 
-ARO cluster creation typically takes **35-50 minutes** (longer than ROSA HCP due to in-VNet control plane).
+ARO creation takes **35-50 minutes**.
 
 #### Step 4: Access the cluster
 
 **Option A: Jumphost** (if `create_jumphost = true`)
 
 ```bash
-# Get jumphost IP and credentials
 JUMP_IP=$(terraform output -raw public_ip)
 
-# SSH tunnel for API and console access
-sudo ssh -L 6443:api.<domain>.<location>.aroapp.io:6443 \
-  -L 443:console-openshift-console.apps.<domain>.<location>.aroapp.io:443 \
+# SSH tunnel
+sudo ssh \
+  -L 6443:api.<domain>.aroapp.io:6443 \
+  -L 443:console-openshift-console\
+.apps.<domain>.aroapp.io:443 \
   aro@$JUMP_IP
 
-# Or use sshuttle for full VPN-like access
-sshuttle --dns -NHr aro@$JUMP_IP 10.0.0.0/20 --daemon
+# Or sshuttle
+sshuttle --dns -NHr aro@$JUMP_IP \
+  10.0.0.0/20 --daemon
 ```
 
-**Option B: Azure P2S VPN** (see the dedicated section below for setup)
+**Option B: Azure P2S VPN** (see below)
 
-#### Step 5: Login to the cluster
+#### Step 5: Login
 
 ```bash
-# Show credentials
 make show_credentials
-
-# Login via oc CLI
 make login
 
 # Or manually:
 API_URL=$(terraform output -raw api_url)
-oc login $API_URL --username=kubeadmin --password=<password> --insecure-skip-tls-verify=true
+oc login $API_URL \
+  --username=kubeadmin \
+  --password=<password> \
+  --insecure-skip-tls-verify=true
 ```
 
 #### Cleanup
 
 ```bash
-# Destroy all resources (service principal cluster)
+# Service principal cluster
 make destroy
 
-# For managed identity clusters, use the special target:
+# Managed identity cluster
 make destroy-managed-identity
 ```
 
-### Access Pattern
-
-1. **Jumphost VM**: Auto-provisioned when API or ingress is Private. SSH into the jumphost, then access the cluster.
-2. **SSH tunnel**: Forward ports 6443 (API) and 443 (console) through the jumphost.
-3. **sshuttle**: VPN-like access through the jumphost — `sshuttle --dns -NHr aro@$JUMP_IP 10.0.0.0/20 --daemon`
-4. **Azure P2S VPN**: Set up a VPN Gateway with OpenVPN for direct laptop-to-VNet connectivity (see detailed guide below).
-
 ### Azure P2S VPN for Private ARO Access
 
-For a better developer experience than SSH tunneling, Azure Point-to-Site VPN provides direct connectivity:
-
 ```
-  Azure P2S VPN Access Flow
-  =========================
+Azure P2S VPN Access Flow
+=========================
 
-  +----------+                     +--------------------+
-  |  Laptop  |    OpenVPN          |  Azure VPN Gateway |
-  |  (macOS) |    (Tunnelblick)    |  (VpnGw1 SKU)     |
-  |          | ------------------> |  GatewaySubnet     |
-  +----------+                     |  10.0.0.64/27      |
-       |                           +----+---------------+
-       | Client IP: 172.16.0.x          |
-       |                                | same VNet
-       |    +---------------------------+
-       |    |
-       |    v
-       |  +--------------------------------------------------+
-       |  |  ARO VNet (10.0.0.0/24)                          |
-       |  |                                                  |
-       |  |  API Server -----> api.<domain>.aroapp.io:6443   |
-       |  |  Console --------> *.apps.<domain>.aroapp.io:443 |
-       |  |  OAuth ----------> oauth-openshift.apps.*:443    |
-       |  +--------------------------------------------------+
-       |
-       |  DNS: /etc/hosts entries required
-       |  (Azure P2S doesn't auto-forward private DNS zones)
-       +---> api.<domain>.<region>.aroapp.io         -> <API private IP>
-       +---> console-openshift-console.apps.<domain> -> <Ingress private IP>
-       +---> oauth-openshift.apps.<domain>           -> <Ingress private IP>
++--------+              +----------------+
+| Laptop |   OpenVPN    | VPN Gateway    |
+| (macOS)|  Tunnelblick | (VpnGw1)      |
+|        |------------>| GatewaySubnet  |
++--------+              | 10.0.0.64/27   |
+    |                   +------+---------+
+    | IP: 172.16.0.x          |
+    |                         | same VNet
+    |    +--------------------+
+    |    |
+    |    v
+    |  +------------------------------+
+    |  | ARO VNet                     |
+    |  |                              |
+    |  | API ---> api.<dom>:6443      |
+    |  | Web ---> *.apps.<dom>:443    |
+    |  | OAuth -> oauth-*:443         |
+    |  +------------------------------+
+    |
+    | DNS: /etc/hosts required
+    | (P2S doesn't forward private DNS)
+    |
+    +--> api.<dom>.<region>.aroapp.io
+    |     -> <API private IP>
+    +--> console-openshift-console
+    |    .apps.<dom>.<region>.aroapp.io
+    |     -> <Ingress private IP>
+    +--> oauth-openshift
+         .apps.<dom>.<region>.aroapp.io
+          -> <Ingress private IP>
 
-  Certificate Chain (required):
-  +----------------+     signs     +------------------+
-  | Root CA        | ------------> | Client Cert      |
-  | (self-signed)  |               | MUST include:    |
-  | uploaded to    |               | extendedKeyUsage |
-  | VPN Gateway    |               | = clientAuth     |
-  +----------------+               +------------------+
+Certificate Chain:
++----------+  signs  +--------------+
+| Root CA  |-------->| Client Cert  |
+| (upload  |         | MUST include |
+|  to GW)  |         | EKU:         |
++----------+         | clientAuth   |
+                     +--------------+
 ```
 
 **Setup steps:**
 
-1. **Create GatewaySubnet** in the ARO VNet (minimum /27)
-2. **Deploy VPN Gateway** (VpnGw1 SKU, takes 30-45 minutes)
-3. **Generate certificates**: Root CA + Client cert with `extendedKeyUsage = clientAuth`
-4. **Configure P2S**: Upload root cert, set client address pool (e.g., `172.16.0.0/24`), protocol = OpenVPN
-5. **Connect**: Download VPN profile, import into Tunnelblick (macOS) or OpenVPN client
+1. **Create GatewaySubnet** (minimum /27)
+2. **Deploy VPN Gateway** (VpnGw1, ~30-45 min)
+3. **Generate certs**: Root CA + Client cert with
+   `extendedKeyUsage = clientAuth`
+4. **Configure P2S**: Upload root cert, set client
+   pool (e.g., `172.16.0.0/24`), OpenVPN protocol
+5. **Connect**: Import `.ovpn` into Tunnelblick
 
-> **Key gotcha**: The client certificate MUST include `extendedKeyUsage = clientAuth` extension. Without it, the VPN Gateway silently rejects the connection with a `connection-reset` after TLS handshake — no error message, just a reset.
+> **Key gotcha**: Client cert MUST include
+> `extendedKeyUsage = clientAuth`. Without it, VPN
+> Gateway silently rejects with a connection-reset
+> after TLS handshake — no error, just a reset.
 
 ### Managed Identities (Preview)
 
-ARO now supports managed identities as an alternative to service principals:
-- Eliminates credential management (no SP secrets to rotate)
+ARO supports managed identities as an alternative
+to service principals:
+- No credential management (no SP secrets to rotate)
 - Creates 9 user-assigned managed identities
-- Currently requires ARM template deployment (Terraform `azurerm` provider doesn't support it natively yet)
-- **Limitation**: NSGs cannot be attached to subnets when using managed identities (preview limitation)
+- Requires ARM template deployment
+- **Limitation**: NSGs cannot be attached to subnets
+  (preview limitation)
 
 ### Gotchas and Lessons Learned
 
-1. **Azure Firewall cost**: Azure Firewall Standard costs ~$900/month. This is a significant cost for lab/dev environments. Consider if the security benefit justifies the cost for non-production use.
+1. **Azure Firewall cost**: ~$900/month. Significant
+   for lab/dev. Evaluate if justified.
 
-2. **Firewall rule maintenance**: The list of required FQDNs can change with ARO/OpenShift updates. Monitor the [official Microsoft documentation](https://learn.microsoft.com/en-us/azure/openshift/howto-restrict-egress) for updates.
+2. **Firewall rule maintenance**: Required FQDNs can
+   change with ARO/OpenShift updates. Monitor the
+   [official docs][aro-egress] for updates.
 
-3. **VPN Gateway provisioning time**: 30-45 minutes. Plan accordingly and use `--no-wait` with monitoring.
+3. **VPN Gateway provisioning**: 30-45 minutes.
+   Use `--no-wait` with monitoring.
 
-4. **VPN certificate EKU**: The `extendedKeyUsage = clientAuth` requirement is not well-documented. Missing it causes silent connection resets that are difficult to debug.
+4. **VPN certificate EKU**: Not well-documented.
+   Missing it causes silent connection resets.
 
-5. **DNS resolution with VPN**: Azure P2S VPN doesn't automatically configure DNS forwarding for private DNS zones. You'll need to manually add `/etc/hosts` entries or set up DNS forwarding.
+5. **DNS with VPN**: P2S VPN doesn't auto-configure
+   DNS forwarding. Need `/etc/hosts` entries.
 
-6. **Single VNet architecture**: The current approach puts the firewall in the same VNet as ARO. A hub-spoke model (firewall in a hub VNet, ARO in a spoke VNet) would be better for production but adds complexity.
+6. **Single VNet**: Current approach has firewall in
+   same VNet. Hub-spoke is better for production.
 
 ---
 
@@ -753,43 +788,45 @@ ARO now supports managed identities as an alternative to service principals:
 ### Traffic Flow Comparison
 
 ```
-  ROSA HCP Zero-Egress                          ARO Zero-Egress
-  =====================                          ===============
+ROSA HCP                    ARO
+Zero-Egress                 Zero-Egress
+===========                 ===========
 
-  Worker Node                                    Worker Node
-      |                                              |
-      | (port 443 to VPC CIDR only)                  | (all egress -> UDR)
-      v                                              v
-  +-------------------+                          +-------------------+
-  | VPC Endpoint      |                          | Azure Firewall    |
-  | (per-service)     |                          | (FQDN filtering)  |
-  |                   |                          |                   |
-  | S3 -----> S3 Svc  |                          | Rule: *.quay.io   |--->  Internet
-  | STS ----> STS Svc |                          | Rule: *.azurecr.io|      (filtered)
-  | ECR ----> ECR Svc |                          | Rule: *.redhat.com|
-  +-------------------+                          +-------------------+
-       |                                              |
-       X  No Internet path                            | Only allowed FQDNs
-       X  (no NAT GW, no IGW)                        | pass through
-                                                      v
-  Control Plane:                                 Control Plane:
-  Red Hat Managed (PrivateLink)                  In-VNet (Master Subnet)
+Worker Node                 Worker Node
+    |                           |
+    | port 443                  | all egress
+    | to VPC CIDR               | -> UDR
+    v                           v
++--------------+          +--------------+
+| VPC Endpoint |          | Azure FW     |
+| (per-svc)    |          | (FQDN filter)|
+|              |          |              |
+| S3 -> S3 Svc|          | *.quay.io  --+-> Net
+| STS-> STS   |          | *.azurecr  --+  (filtered)
+| ECR-> ECR   |          | *.redhat   --+
++--------------+          +--------------+
+     |                         |
+     X No Internet             | Allowed FQDNs
+     X (no NAT/IGW)            | pass through
 
-  Cost: ~$30-60/mo                               Cost: ~$900+/mo
-  (VPC Endpoints)                                 (Azure Firewall Standard)
+Control Plane:             Control Plane:
+Red Hat Managed            In-VNet
+(PrivateLink)              (Master Subnet)
+
+Cost: ~$30-60/mo           Cost: ~$900+/mo
+(VPC Endpoints)            (Azure FW Std)
 ```
 
 | Category | ROSA HCP | ARO |
 |----------|----------|-----|
-| **Egress blocking mechanism** | No NAT GW + private subnets + VPC Endpoints | Azure Firewall + UDR + application rules |
-| **Monthly cost of egress control** | ~$30-60 (VPC Endpoints) | ~$900+ (Azure Firewall) |
-| **Setup complexity** | Lower (hosted control plane) | Higher (firewall rules, UDR, multiple subnets) |
-| **Required subnets** | Private subnets only (1 per AZ) | Master, Worker, Firewall, Jumphost, (Optional) PE subnet |
-| **FQDN allowlisting needed?** | No (VPC Endpoints handle service access) | Yes (firewall application rules) |
-| **Control plane location** | Red Hat managed (outside customer VPC) | Customer VNet (master subnet) |
-| **Best access method** | AWS Client VPN or VPC Peering | Azure P2S VPN or sshuttle |
-| **Terraform maturity** | Validated pattern (modular) | Single repo (conditional resources) |
-| **Managed identity support** | N/A (uses STS/OIDC) | Preview (9 managed identities) |
+| **Egress mechanism** | No NAT + VPC Endpoints | Azure FW + UDR |
+| **Monthly cost** | ~$30-60 | ~$900+ |
+| **Complexity** | Lower | Higher |
+| **Subnets** | Private (1/AZ) | Master, Worker, FW, Jump |
+| **FQDN allowlist?** | No | Yes |
+| **Control plane** | Red Hat managed | Customer VNet |
+| **Best access** | Client VPN | P2S VPN / sshuttle |
+| **Managed identity** | N/A (STS/OIDC) | Preview |
 
 ---
 
@@ -797,25 +834,40 @@ ARO now supports managed identities as an alternative to service principals:
 
 ### For Customers
 
-1. **Start with ROSA HCP** if on AWS — zero-egress is simpler and cheaper to implement due to the hosted control plane and VPC Endpoint model.
-2. **Budget for Azure Firewall** if on ARO — it's a non-trivial cost (~$900/mo) that customers often overlook.
-3. **Use VPN for developer access** — both AWS Client VPN and Azure P2S VPN provide much better developer experience than SSH tunneling through bastion hosts.
-4. **Plan for DNS** — private clusters require careful DNS configuration. Route53 Private Hosted Zone associations (AWS) or `/etc/hosts` entries (Azure) are needed for cross-VPC/VPN access.
+1. **Start with ROSA HCP** if on AWS — simpler and
+   cheaper due to hosted control plane.
+2. **Budget for Azure Firewall** if on ARO —
+   ~$900/mo is often overlooked.
+3. **Use VPN for dev access** — much better than SSH
+   tunneling through bastion hosts.
+4. **Plan for DNS** — Route53 PHZ associations (AWS)
+   or `/etc/hosts` entries (Azure) are needed.
 
 ### For SAs/Architects
 
-1. **Know the VPC Endpoint requirements** — customers often ask "what endpoints do I need?" The answer differs between ROSA HCP (4-6 endpoints) and traditional ROSA (more endpoints needed since control plane is in-VPC).
-2. **Test egress thoroughly** — deploy a sample application and verify it can pull images, authenticate, and access required services.
-3. **Document firewall rules** — for ARO, maintain a living document of required FQDNs. These change with OpenShift versions.
-4. **Consider hub-spoke for production** — single VNet works for demos but production ARO should use hub-spoke architecture.
+1. **Know VPC Endpoint requirements** — differs
+   between ROSA HCP (4-6) and traditional ROSA.
+2. **Test egress thoroughly** — verify image pulls,
+   auth, and required service access.
+3. **Document firewall rules** — maintain a living
+   doc of required FQDNs for ARO.
+4. **Hub-spoke for production** — single VNet works
+   for demos but not production ARO.
 
 ---
 
 ## References
 
-- [ROSA Zero-Egress Documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_service_on_aws/)
-- [ARO Egress Restriction Guide](https://learn.microsoft.com/en-us/azure/openshift/howto-restrict-egress)
-- [ARO Private Cluster Guide](https://learn.microsoft.com/en-us/azure/openshift/howto-create-private-cluster-4x)
-- [AWS VPC Endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints.html)
-- [Azure P2S VPN Overview](https://learn.microsoft.com/en-us/azure/vpn-gateway/point-to-site-about)
-- [ROSA CLI Reference](https://docs.redhat.com/en/documentation/red_hat_openshift_service_on_aws/4/html/rosa_cli/rosa-get-started-cli)
+- [ROSA Documentation][rosa-docs]
+- [ARO Egress Restriction Guide][aro-egress]
+- [ARO Private Cluster Guide][aro-private]
+- [AWS VPC Endpoints][vpc-endpoints]
+- [Azure P2S VPN Overview][azure-vpn]
+- [ROSA CLI Reference][rosa-cli]
+
+[rosa-docs]: https://docs.redhat.com/en/documentation/red_hat_openshift_service_on_aws/
+[aro-egress]: https://learn.microsoft.com/en-us/azure/openshift/howto-restrict-egress
+[aro-private]: https://learn.microsoft.com/en-us/azure/openshift/howto-create-private-cluster-4x
+[vpc-endpoints]: https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints.html
+[azure-vpn]: https://learn.microsoft.com/en-us/azure/vpn-gateway/point-to-site-about
+[rosa-cli]: https://docs.redhat.com/en/documentation/red_hat_openshift_service_on_aws/4/html/rosa_cli/rosa-get-started-cli

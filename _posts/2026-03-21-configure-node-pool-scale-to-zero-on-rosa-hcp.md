@@ -293,15 +293,16 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
     watch -n 10 'oc get nodes -l workload=scale-test'
     ```
 
-    The scale-down process involves three phases:
+    The scale-down process has two phases:
 
     | Phase | Duration | Description |
     |---|---|---|
-    | Cooldown (`delay_after_add`) | up to ~10 minutes | Autoscaler will not evaluate scale-down until this period has elapsed since the node was added. **Skipped** if the node has been running longer than this period. |
-    | Idle assessment (`unneeded_time`) | ~10 minutes | Once cooldown has passed, the node must be continuously idle for this duration before removal is triggered |
+    | Idle assessment | ~15 minutes | Autoscaler continuously observes the node as unneeded before triggering removal |
     | Drain + removal | ~2 minutes | Pod eviction, node drain, and EC2 instance termination |
 
-    > **Note:** The `delay_after_add` timer starts when the **node is added**, not when the workload is deleted. If the workload ran for several minutes before deletion, part of the cooldown has already elapsed. In our testing (workload deleted ~6 minutes after node was added), the total scale-down time was **~17 minutes**. If the node has been running for longer than the cooldown period, scale-down takes **~12 minutes** (idle assessment + drain only).
+    The total time from workload deletion to node removal is typically **~17 minutes**.
+
+    > **Note:** This was verified by deleting a workload from a node that had been running for over 15 minutes (ensuring any `delay_after_add` cooldown had fully expired). The ~15-minute idle assessment is a ROSA HCP platform-managed default and cannot be changed by the user.
 
 1. Verify the node pool has scaled back to 0.
 
@@ -317,16 +318,14 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
     ocm get /api/clusters_mgmt/v1/clusters/$CLUSTER_ID/autoscaler | jq .
     ```
 
-1. The autoscaler uses the following default scale-down parameters:
+1. On ROSA HCP, the scale-down behavior uses platform-managed defaults:
 
-    | Parameter | Default | Description |
+    | Parameter | Observed Default | Description |
     |---|---|---|
-    | `unneeded_time` | ~10m | How long a node must be idle before removal |
-    | `utilization_threshold` | 0.5 | Node utilization below this triggers scale-down evaluation |
-    | `delay_after_add` | ~10m | Wait period after a node is added before evaluating scale-down |
-    | `delay_after_delete` | varies | Wait period between consecutive node removals |
+    | Idle assessment | ~15 minutes | How long a node must be continuously idle before removal is triggered |
+    | Drain + removal | ~2 minutes | Time to evict pods and terminate the EC2 instance |
 
-    > **Note:** On ROSA HCP, the `scale_down` parameters (such as `unneeded_time`, `delay_after_add`) **cannot be customized**. These settings are only configurable on ROSA Classic clusters. HCP clusters use platform-managed defaults.
+    > **Note:** On ROSA HCP, the `scale_down` parameters (such as `unneeded_time`, `delay_after_add`, `utilization_threshold`) **cannot be customized**. The OCM API rejects `scale_down` configuration changes with `"Attribute 'scale_down' is not allowed"`. These settings are only configurable on ROSA Classic clusters.
 
 ## Minimum Replica Constraint
 

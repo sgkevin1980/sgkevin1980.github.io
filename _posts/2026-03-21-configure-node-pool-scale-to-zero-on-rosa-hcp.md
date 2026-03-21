@@ -270,7 +270,8 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
 
     | Phase | Duration | Description |
     |---|---|---|
-    | Idle assessment | ~15 minutes | Autoscaler continuously observes the node as unneeded |
+    | Cooldown (`delay_after_add`) | ~5 minutes | Autoscaler waits after the previous scale-up before evaluating scale-down |
+    | Idle assessment (`unneeded_time`) | ~10 minutes | Node must be continuously idle before removal is triggered |
     | Drain + removal | ~2 minutes | Pod eviction, node drain, and EC2 instance termination |
 
     The total time from deployment deletion to node removal is typically **~17 minutes**.
@@ -430,7 +431,7 @@ Based on testing with a tainted node pool (m5.xlarge), the following scale-down 
 | Average (10 cycles) | ~20 minutes |
 | Range | 16-28 minutes |
 
-- **Scale-down** includes: idle assessment period (~15 min) + drain and EC2 termination (~2 min).
+- **Scale-down** includes: cooldown after scale-up (~5 min) + idle assessment (~10 min) + drain and EC2 termination (~2 min).
 - Outliers can occur due to autoscaler cooldown timers (`delay_after_add`) following recent scale-up events.
 
 ## Cleanup

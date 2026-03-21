@@ -422,19 +422,6 @@ To avoid this:
 - **Keep at least one general-purpose pool** with `min_replicas >= 1` that is large enough to host all system pods.
 - **The [minimum replica constraint](#minimum-replica-constraint) still applies** — ensure your non-tainted pools still guarantee at least 2 replicas.
 
-## Expected Scale-Down Times
-
-Based on testing with a tainted node pool (m5.xlarge), the following scale-down times were observed:
-
-| Metric | Scale-Down (1 to 0 nodes) |
-|---|---|
-| Typical | ~17 minutes |
-| Average (10 cycles) | ~20 minutes |
-| Range | 16-28 minutes |
-
-- **Scale-down** includes: cooldown after scale-up (~5 min, if applicable) + idle assessment (~10 min) + drain and EC2 termination (~2 min).
-- Outliers can occur due to autoscaler cooldown timers (`delay_after_add`) following recent scale-up events.
-
 ## Cleanup
 
 1. Delete the test namespace.

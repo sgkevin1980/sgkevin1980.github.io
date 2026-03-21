@@ -231,6 +231,33 @@ With the node pool at 0 nodes, deploy a workload that targets it. The cluster au
     scale-test-app-xxxxxxxxx-xxxxx   0/1     Pending   0          10s
     ```
 
+1. Check the cluster autoscaler status to confirm scale-up has been triggered.
+
+    ```bash
+    oc get configmap cluster-autoscaler-status -n kube-system \
+      -o jsonpath='{.data.status}' | grep -A2 'scaleUp'
+    ```
+
+    You should see:
+
+    ```
+    scaleUp:
+      status: InProgress
+    ```
+
+    You can also check cluster events for the scale-up trigger:
+
+    ```bash
+    oc get events -A --field-selector reason=TriggeredScaleUp --sort-by='.lastTimestamp'
+    ```
+
+    You should see an event like:
+
+    ```
+    NAMESPACE   ...   TriggeredScaleUp   pod/scale-test-app-xxxxx   pod triggered scale-up:
+    [{<node-pool-machine-deployment> 0->1 (max: 2)}]
+    ```
+
 1. In a separate terminal, watch for the new node to appear.
 
     ```bash
@@ -283,9 +310,7 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
     rosa describe machinepool -c $CLUSTER_NAME zero-pool
     ```
 
-## Tuning the Cluster Autoscaler
-
-The default autoscaler configuration uses conservative scale-down timers. You can tune these to fit your requirements.
+## Cluster Autoscaler Configuration
 
 1. View the current autoscaler configuration.
 
@@ -293,28 +318,16 @@ The default autoscaler configuration uses conservative scale-down timers. You ca
     ocm get /api/clusters_mgmt/v1/clusters/$CLUSTER_ID/autoscaler | jq .
     ```
 
-1. Adjust scale-down parameters if desired.
-
-    ```bash
-    ocm patch /api/clusters_mgmt/v1/clusters/$CLUSTER_ID/autoscaler <<'EOF'
-    {
-      "scale_down": {
-        "enabled": true,
-        "unneeded_time": "5m",
-        "utilization_threshold": "0.5",
-        "delay_after_add": "5m",
-        "delay_after_delete": "1m"
-      }
-    }
-    EOF
-    ```
+1. The autoscaler uses the following default scale-down parameters:
 
     | Parameter | Default | Description |
     |---|---|---|
     | `unneeded_time` | ~10m | How long a node must be idle before removal |
     | `utilization_threshold` | 0.5 | Node utilization below this triggers scale-down evaluation |
-    | `delay_after_add` | 10m | Wait period after a scale-up before evaluating scale-down |
+    | `delay_after_add` | ~5m | Wait period after a scale-up before evaluating scale-down |
     | `delay_after_delete` | varies | Wait period between consecutive node removals |
+
+    > **Note:** On ROSA HCP, the `scale_down` parameters (such as `unneeded_time`, `delay_after_add`) **cannot be customized**. These settings are only configurable on ROSA Classic clusters. HCP clusters use platform-managed defaults.
 
 ## Minimum Replica Constraint
 

@@ -293,16 +293,15 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
     watch -n 10 'oc get nodes -l workload=scale-test'
     ```
 
-    The scale-down process has two phases:
+    The scale-down process involves three phases:
 
     | Phase | Duration | Description |
     |---|---|---|
-    | Cooldown (`delay_after_add`) | ~5 minutes | Autoscaler waits after a recent scale-up before evaluating scale-down. **Skipped** if no recent scale-up occurred. |
-    | Idle assessment (`unneeded_time`) | ~10 minutes | Node must be continuously idle before removal is triggered |
+    | Cooldown (`delay_after_add`) | up to ~10 minutes | Autoscaler will not evaluate scale-down until this period has elapsed since the node was added. **Skipped** if the node has been running longer than this period. |
+    | Idle assessment (`unneeded_time`) | ~10 minutes | Once cooldown has passed, the node must be continuously idle for this duration before removal is triggered |
     | Drain + removal | ~2 minutes | Pod eviction, node drain, and EC2 instance termination |
 
-    - If the node was **recently scaled up**: ~5 + ~10 + ~2 = **~17 minutes**
-    - If the node was **already running** (no recent scale-up): ~10 + ~2 = **~12 minutes**
+    > **Note:** The `delay_after_add` timer starts when the **node is added**, not when the workload is deleted. If the workload ran for several minutes before deletion, part of the cooldown has already elapsed. In our testing (workload deleted ~6 minutes after node was added), the total scale-down time was **~17 minutes**. If the node has been running for longer than the cooldown period, scale-down takes **~12 minutes** (idle assessment + drain only).
 
 1. Verify the node pool has scaled back to 0.
 
@@ -324,7 +323,7 @@ When the workload is removed, the cluster autoscaler will detect the node as idl
     |---|---|---|
     | `unneeded_time` | ~10m | How long a node must be idle before removal |
     | `utilization_threshold` | 0.5 | Node utilization below this triggers scale-down evaluation |
-    | `delay_after_add` | ~5m | Wait period after a scale-up before evaluating scale-down |
+    | `delay_after_add` | ~10m | Wait period after a node is added before evaluating scale-down |
     | `delay_after_delete` | varies | Wait period between consecutive node removals |
 
     > **Note:** On ROSA HCP, the `scale_down` parameters (such as `unneeded_time`, `delay_after_add`) **cannot be customized**. These settings are only configurable on ROSA Classic clusters. HCP clusters use platform-managed defaults.

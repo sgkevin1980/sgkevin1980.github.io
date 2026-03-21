@@ -237,7 +237,7 @@ With the node pool at 0 nodes, deploy a workload that targets it. The cluster au
     watch -n 10 'oc get nodes -l workload=scale-test'
     ```
 
-    Within approximately **5-6 minutes**, you should see a new node become `Ready` and the pods transition to `Running`.
+    After a few minutes, you should see a new node become `Ready` and the pods transition to `Running`.
 
     ```
     NAME                                          STATUS   ROLES    AGE   VERSION
@@ -420,17 +420,16 @@ To avoid this:
 - **Keep at least one general-purpose pool** with `min_replicas >= 1` that is large enough to host all system pods.
 - **The [minimum replica constraint](#minimum-replica-constraint) still applies** — ensure your non-tainted pools still guarantee at least 2 replicas.
 
-## Expected Scale-Up and Scale-Down Times
+## Expected Scale-Down Times
 
-Based on testing with a tainted node pool (m5.xlarge), the following times were observed:
+Based on testing with a tainted node pool (m5.xlarge), the following scale-down times were observed:
 
-| Metric | Scale-Up (0 to 1 node) | Scale-Down (1 to 0 nodes) |
-|---|---|---|
-| Typical | ~5-6 minutes | ~17 minutes |
-| Average (10 cycles) | ~7 minutes | ~20 minutes |
-| Range | 5-21 minutes | 16-28 minutes |
+| Metric | Scale-Down (1 to 0 nodes) |
+|---|---|
+| Typical | ~17 minutes |
+| Average (10 cycles) | ~20 minutes |
+| Range | 16-28 minutes |
 
-- **Scale-up** includes: autoscaler detection of pending pods, EC2 instance provisioning, node bootstrap, and pod scheduling.
 - **Scale-down** includes: idle assessment period (~10 min) + drain and EC2 termination (~2-3 min).
 - Outliers can occur due to autoscaler cooldown timers (`delay_after_add`) following recent scale-up events.
 

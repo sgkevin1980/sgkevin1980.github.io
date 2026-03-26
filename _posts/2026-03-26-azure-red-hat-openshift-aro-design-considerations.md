@@ -35,20 +35,20 @@ date: 2026-03-26
 | **Private** | Private IP (control plane subnet) | Internal LB | Public LB (default) | Production, regulated workloads |
 | **Private without Public IP** | Private IP | Internal LB | UDR (User Defined Routing) | Highest security, air-gapped/disconnected |
 
-### Recommendation for Banking Customer
+### Recommendation for Regulated / Enterprise Environments
 
 - **Private cluster without public IP** (`--apiserver-visibility Private --ingress-visibility Private --outbound-type UserDefinedRouting`)
 - API server is only accessible from within the VNET or peered networks
 - Egress traffic is routed through Azure Firewall or NVA via UDR — no public IP is provisioned on the cluster
 - Access to the OpenShift console and API requires a jump box, VPN, or Azure Bastion within the peered network
-- Custom domain is recommended (e.g., `aro.bank.com.my`) with enterprise-managed TLS certificates for both ingress and API server
+- Custom domain is recommended (e.g., `aro.example.com`) with enterprise-managed TLS certificates for both ingress and API server
 
 ### Key Decisions
 
 | Decision | Options | Recommendation |
 |----------|---------|----------------|
 | Outbound type | LoadBalancer / UserDefinedRouting | **UDR** — required for no public IP |
-| Custom domain | Default (`*.aroapp.io`) / Custom | **Custom domain** — bank branding and certificate control |
+| Custom domain | Default (`*.aroapp.io`) / Custom | **Custom domain** — enterprise branding and certificate control |
 | Pull secret | With / Without Red Hat pull secret | **With** — enables Operator Hub and Red Hat registry access |
 | Deployment method | Azure Portal / CLI / Terraform / ARM | **Terraform** — infrastructure-as-code, repeatable, auditable |
 | Subscription model | Single / Separate for Prod & Non-Prod | **Separate subscriptions** — per-subscription resource limits, security isolation, billing separation |
@@ -96,7 +96,7 @@ ARO requires a VNET with two dedicated subnets (control plane and worker nodes).
 
 ### Private Link Endpoints
 
-For a banking environment, all Azure PaaS services should be accessed via Private Link endpoints to prevent data traversing the public internet:
+For a regulated / enterprise environment, all Azure PaaS services should be accessed via Private Link endpoints to prevent data traversing the public internet:
 
 | Azure Service | Private Endpoint Required | Subnet |
 |--------------|--------------------------|--------|
@@ -142,7 +142,7 @@ For a private cluster with UDR:
 
 | Connectivity | Method | Notes |
 |-------------|--------|-------|
-| On-premises | **Azure ExpressRoute** or Site-to-Site VPN | ExpressRoute recommended for banking — dedicated, private connection |
+| On-premises | **Azure ExpressRoute** or Site-to-Site VPN | ExpressRoute recommended for regulated environments — dedicated, private connection |
 | Other Azure VNETs | **VNET Peering** | ARO spoke peered to Hub VNET; Hub peers to other spokes |
 | DNS resolution | Azure Private DNS Zones + conditional forwarding | Forward on-prem domains to on-prem DNS; ARO uses CoreDNS with configurable forwarding |
 
@@ -164,9 +164,9 @@ There are **two approaches** to expose internet-facing applications from a priva
 
 Set a custom domain during cluster installation using the `--domain` flag. This replaces the default `*.aroapp.io` domain for all cluster routes (console, API, application routes).
 
-- Set at creation time: `az aro create ... --domain bank.com.my`
-- All routes use this domain: `*.apps.bank.com.my`
-- Customer manages DNS (Azure DNS or corporate DNS) and TLS certificates
+- Set at creation time: `az aro create ... --domain example.com`
+- All routes use this domain: `*.apps.example.com`
+- Organization manages DNS (Azure DNS or corporate DNS) and TLS certificates
 - **Cannot be changed after cluster creation**
 - Reference: https://cloud.redhat.com/experts/aro/custom-domain-private-cluster/
 
@@ -175,7 +175,7 @@ Set a custom domain during cluster installation using the `--domain` flag. This 
 Create a second IngressController post-install with its own domain and its own Azure Load Balancer. This is the **recommended approach** for exposing specific internet-facing apps while keeping the default router for internal traffic.
 
 - Default IngressController remains internal (corporate traffic)
-- Additional IngressController gets a dedicated domain (e.g., `*.api.bank.com.my`) and its own Load Balancer
+- Additional IngressController gets a dedicated domain (e.g., `*.api.example.com`) and its own Load Balancer
 - The additional IngressController's Load Balancer can be **External** (public IP) — even though the cluster itself has no public IP on its nodes. The `--ingress-visibility Private` flag only applies to the default IngressController
 - Reference: https://cloud.redhat.com/experts/aro/additional-ingress-controller/
 
@@ -199,7 +199,7 @@ Create a second IngressController post-install with its own domain and its own A
                       │                │                │
              ┌────────▼────────┐       │       ┌────────▼────────┐
              │  Azure Front     │       │       │ Public DNS      │
-             │  Door + WAF      │       │       │ (bank.com.my)   │
+             │  Door + WAF      │       │       │ (example.com)   │
              │  (global L7)     │       │       │                 │
              └────────┬─────────┘       │       └────────┬────────┘
                       │ Pvt Link        │                │
@@ -321,13 +321,13 @@ Corporate network → ExpressRoute/VPN → Hub VNET → Peering → Spoke VNET
 ```
 
 - No internet exposure — only reachable from corporate network
-- OpenShift Routes with `host: staff.internal.bank.com.my` route to the correct service
+- OpenShift Routes with `host: staff.internal.example.com` route to the correct service
 - DNS: internal apps resolve via Azure Private DNS Zones linked to corporate DNS
 
 **Admin / Developer access:**
 
 ```
-Admin laptop → Azure Bastion → Jump Box VM → oc login https://api.aro.bank.com.my:6443
+Admin laptop → Azure Bastion → Jump Box VM → oc login https://api.aro.example.com:6443
 ```
 
 - API server has no public IP — only accessible from within the VNET
@@ -343,9 +343,9 @@ Admin laptop → Azure Bastion → Jump Box VM → oc login https://api.aro.bank
 | **DDoS protection** | Azure DDoS Protection Standard | Built into Front Door |
 | **Global load balancing** | No (single region) | Yes (multi-region) |
 | **TLS offloading layers** | 1 (Router) | 3 (Front Door → App Gateway → Router) |
-| **Suitable for** | Internal APIs, B2B, limited internet exposure | Customer-facing portals, mobile banking, regulatory-mandated WAF |
+| **Suitable for** | Internal APIs, B2B, limited internet exposure | Customer-facing portals, mobile apps, regulatory-mandated WAF |
 
-> **Recommendation for banking:** Start with **Option 1** (Public LB) for B2B APIs and internal-facing internet services. Use **Option 2** (Front Door + App Gateway) for customer-facing apps that require WAF and DDoS protection.
+> **Recommendation for regulated environments:** Start with **Option 1** (Public LB) for B2B APIs and internal-facing internet services. Use **Option 2** (Front Door + App Gateway) for customer-facing apps that require WAF and DDoS protection.
 
 ### Separating Internal and External Traffic
 
@@ -353,8 +353,8 @@ By default, ARO creates a single default IngressController (router) with one Int
 
 | IngressController | Domain | Load Balancer | Serves |
 |-------------------|--------|---------------|--------|
-| `default` | `*.apps.internal.bank.com.my` | Internal LB (Private IP) | Internal apps — corporate access only |
-| `external` | `*.apps.bank.com.my` | Public LB (for Option 1) or Internal LB fronted by App Gateway (for Option 2) | Internet-facing apps |
+| `default` | `*.apps.internal.example.com` | Internal LB (Private IP) | Internal apps — corporate access only |
+| `external` | `*.apps.example.com` | Public LB (for Option 1) or Internal LB fronted by App Gateway (for Option 2) | Internet-facing apps |
 
 ```yaml
 # Example: additional IngressController for external apps (Option 1 — Public LB)
@@ -364,7 +364,7 @@ metadata:
   name: external
   namespace: openshift-ingress-operator
 spec:
-  domain: apps.bank.com.my
+  domain: apps.example.com
   replicas: 2
   endpointPublishingStrategy:
     type: LoadBalancerService
@@ -390,7 +390,7 @@ metadata:
   name: external
   namespace: openshift-ingress-operator
 spec:
-  domain: apps.bank.com.my
+  domain: apps.example.com
   replicas: 2
   endpointPublishingStrategy:
     type: LoadBalancerService
@@ -419,7 +419,7 @@ metadata:
   labels:
     exposure: external     # picked up by 'external' IngressController
 spec:
-  host: api.apps.bank.com.my
+  host: api.apps.example.com
   to:
     kind: Service
     name: customer-api-svc
@@ -432,7 +432,7 @@ kind: Route
 metadata:
   name: staff-portal
 spec:
-  host: staff.apps.internal.bank.com.my
+  host: staff.apps.internal.example.com
   to:
     kind: Service
     name: staff-portal-svc
@@ -452,7 +452,7 @@ The default OpenShift Router (HAProxy-based IngressController) handles the vast 
 | **Multi-tenant isolation** | Dedicated ingress per tenant with independent TLS, rate limits, and WAF policies — beyond what routeSelector offers | NGINX Ingress (one instance per tenant namespace) |
 | **Kubernetes Gateway API** | Organization wants to adopt the newer Gateway API standard instead of OpenShift Routes or Ingress resources | Envoy Gateway, Istio, Traefik |
 | **TCP/UDP passthrough** | Non-HTTP protocols (databases, MQTT, custom TCP) that need L4 load balancing directly into the cluster | NGINX Ingress (TCP/UDP ConfigMap), MetalLB (bare-metal only — not applicable to ARO) |
-| **Mutual TLS (mTLS) at ingress** | Client certificate authentication required at the edge (e.g., bank-to-bank API, PSD2 compliance) | NGINX Ingress, Istio IngressGateway |
+| **Mutual TLS (mTLS) at ingress** | Client certificate authentication required at the edge (e.g., B2B API, mutual authentication compliance) | NGINX Ingress, Istio IngressGateway |
 
 **When NOT to use a custom ingress controller:**
 
@@ -514,7 +514,7 @@ The default OpenShift Router (HAProxy-based IngressController) handles the vast 
 - **Azure Workload Identity** for pods that need to access Azure services (Key Vault, Storage, SQL, etc.) without storing credentials:
   - Federated identity credential: links a Kubernetes service account to an Azure Managed Identity
   - Pod mounts a projected service account token → exchanges it for an Azure AD token via OIDC
-  - Eliminates stored secrets for Azure service access — critical for banking security posture
+  - Eliminates stored secrets for Azure service access — critical for enterprise security posture
   - Configure per application namespace: one Managed Identity per application team
 - Use **User-Assigned Managed Identities** (not system-assigned) for better lifecycle management
 
@@ -533,12 +533,12 @@ The default OpenShift Router (HAProxy-based IngressController) handles the vast 
 | Node Type | Suggested VM Size | Count | Notes |
 |-----------|------------------|-------|-------|
 | Control plane | Standard_D8s_v3 (8 vCPU, 32 GiB) | 3 | Managed by ARO — not configurable post-creation. SRE will resize if overutilized — keep 2x vCPU quota available |
-| Worker (general) | Standard_D16s_v5 (16 vCPU, 64 GiB) | 6-18 | Application workloads. Size based on FWD financial services reference (16 vCPU, 64 GB per node) |
+| Worker (general) | Standard_D16s_v5 (16 vCPU, 64 GiB) | 6-18 | Application workloads. Size based on enterprise reference (16 vCPU, 64 GB per node) |
 | Worker (infra) | Standard_D8s_v5 (8 vCPU, 32 GiB) | 3 | **Not created by default** — must create post-install via new MachineSets. Hosts router, monitoring, registry. Label as `node-role.kubernetes.io/infra` to avoid OCP subscription costs |
 | Worker (infra-logging) | Standard_E8s_v5 (8 vCPU, 64 GiB) | 3 | **Not created by default** — optional dedicated nodes for logging stack (Loki/EFK) if high log volume. Memory-optimized |
 | Worker (GPU) | Standard_NC series | As needed | For AI/ML workloads |
 
-> **Reference sizing from financial services deployment (FWD):**
+> **Reference sizing from enterprise deployment:**
 > - Non-Prod: ~230 vCPU, ~456 GB memory → 18 worker nodes (D16, 16 vCPU, 64 GB) + 3 infra + 3 infra-logging
 > - Prod: ~125 vCPU, ~403 GB memory → 12 worker nodes + dedicated DB workers + 3 infra + 3 infra-logging
 > - Add 1 extra worker per AZ (3 total) as failover capacity
@@ -581,7 +581,7 @@ Infrastructure nodes run platform services and **do not count toward OpenShift s
 | **Cluster Autoscaler** | Automatically adds/removes worker nodes based on pending pods | Configure min/max per MachineSet |
 | **Horizontal Pod Autoscaler (HPA)** | Scales pod replicas based on CPU/memory metrics | Per-deployment configuration |
 | **Vertical Pod Autoscaler (VPA)** | Adjusts pod resource requests based on actual usage | Use in recommendation mode first |
-| **KEDA (Event-Driven Autoscaling)** | Scales based on external event sources (queue length, Kafka lag, Prometheus metrics, cron schedules) | Install via OperatorHub; useful for banking batch processing and message-driven workloads |
+| **KEDA (Event-Driven Autoscaling)** | Scales based on external event sources (queue length, Kafka lag, Prometheus metrics, cron schedules) | Install via OperatorHub; useful for enterprise batch processing and message-driven workloads |
 | **Machine Health Check** | Automatically replaces unhealthy nodes | Configure for each MachineSet |
 
 ### Autoscaler Recommendations
@@ -641,7 +641,7 @@ spec:
 | `managed-csi-encrypted` | `disk.csi.azure.com` | Retain | WaitForFirstConsumer | With customer-managed encryption key |
 | `azurefile-csi-premium` | `file.csi.azure.com` | Delete | Immediate | For RWX workloads |
 
-### Recommendations for Banking
+### Recommendations for Regulated / Enterprise Environments
 
 - Use **Premium SSD v2** or **Ultra Disk** for database workloads requiring high IOPS
 - Enable **Customer-Managed Keys (CMK)** for disk encryption via Azure Key Vault
@@ -653,7 +653,7 @@ spec:
 ### Internal Image Registry
 
 - ARO's built-in image registry uses Azure Blob Storage by default
-- For banking: configure to use a dedicated storage account with private endpoint and CMK encryption
+- For regulated environments: configure to use a dedicated storage account with private endpoint and CMK encryption
 
 ---
 
@@ -702,9 +702,9 @@ spec:
 
 | Control | Implementation | Notes |
 |---------|---------------|-------|
-| **FIPS compliance** | `--fips` flag at cluster creation | Required for banking regulatory compliance; cannot be changed after creation |
+| **FIPS compliance** | `--fips` flag at cluster creation | Required for regulatory compliance; cannot be changed after creation |
 | **Pod Security** | Pod Security Admission (PSA) / Security Context Constraints (SCC) | Enforce `restricted` SCC by default; only elevate for verified workloads |
-| **Network Policies** | OVN-Kubernetes NetworkPolicy | Enforce micro-segmentation between namespaces; highly recommended for banking |
+| **Network Policies** | OVN-Kubernetes NetworkPolicy | Enforce micro-segmentation between namespaces; highly recommended for regulated environments |
 | **Image security** | Red Hat Quay + Clair scanning, or Azure Defender for Containers | Scan all images before deployment; enforce image signing with Cosign/Sigstore |
 | **Vulnerability scanning** | Microsoft Defender for Containers | Enable on the ARO cluster |
 | **Compliance scanning** | OpenShift Compliance Operator | CIS benchmark profile, daily scan at 3 AM, 7-day report retention, auto-remediation disabled initially |
@@ -744,7 +744,7 @@ ARO inherits Azure compliance certifications:
 
 | Layer | Tool | Data Collected |
 |-------|------|---------------|
-| **Platform health** | ARO SRE (Microsoft + Red Hat Geneva) | Cluster health, node status, API availability — automatic, no customer config needed |
+| **Platform health** | ARO SRE (Microsoft + Red Hat Geneva) | Cluster health, node status, API availability — automatic, no user config needed |
 | **Cluster metrics** | Built-in Prometheus + Grafana | CPU, memory, pod metrics, etcd, API server latency |
 | **Azure-level monitoring** | Azure Monitor Container Insights | Node/pod performance, container logs, Kubernetes events |
 | **Application metrics** | User Workload Monitoring (Prometheus) | Custom application metrics via ServiceMonitor |
@@ -772,7 +772,7 @@ ARO inherits Azure compliance certifications:
 
 ### Logging Storage Sizing (Reference)
 
-Based on BLS financial services deployment:
+Reference logging storage sizing:
 
 | Component | Storage | Notes |
 |-----------|---------|-------|
@@ -788,7 +788,7 @@ Based on BLS financial services deployment:
 - Enable **OVN-Kubernetes flow logging** for network traffic visibility between pods and namespaces
 - Use **OpenShift Network Observability Operator** (eBPF-based) to collect flow logs without sidecar overhead
 - Forward network flow data to Loki for querying and Grafana for dashboards
-- Key use cases for banking: detect unexpected cross-namespace traffic, identify external communication patterns, audit network policy effectiveness
+- Key use cases for regulated environments: detect unexpected cross-namespace traffic, identify external communication patterns, audit network policy effectiveness
 
 ### Key Alerts to Configure
 
@@ -859,9 +859,9 @@ OADP is the built-in backup tool for OpenShift, based on Velero:
 
 | Decision | Options | Recommendation |
 |----------|---------|----------------|
-| DR topology | Active-Active / Active-Passive / Pilot Light | **Active-Passive** — cost-effective for banking; Active-Active for mission-critical APIs |
+| DR topology | Active-Active / Active-Passive / Pilot Light | **Active-Passive** — cost-effective for most enterprises; Active-Active for mission-critical APIs |
 | State management | Velero backup-restore / GitOps + DB replication | **GitOps for stateless** (rebuild from Git); **Velero + DB replication for stateful** |
-| Failover trigger | Manual / Automated (Azure Front Door health probe) | **Manual with automated detection** — banking prefers controlled failover |
+| Failover trigger | Manual / Automated (Azure Front Door health probe) | **Manual with automated detection** — enterprises prefer controlled failover |
 | DR testing | Quarterly / Bi-annually | **Quarterly** — regulatory requirement |
 
 ---
@@ -877,7 +877,7 @@ OADP is the built-in backup tool for OpenShift, based on Velero:
 | Node scaling | Customer (manual or autoscaler) | As needed |
 | Operator updates | Customer | Review and approve in Operator Hub |
 
-### GitOps — Recommended for Banking
+### GitOps — Recommended for Enterprise
 
 - Use **OpenShift GitOps (ArgoCD)** for declarative, auditable deployments
 - All cluster configuration and application manifests stored in Git
@@ -1036,7 +1036,7 @@ Apply consistent Azure tags and OpenShift labels for cost tracking:
 | # | Design Area | Decision | Status |
 |---|------------|----------|--------|
 | 1 | Deployment model | Private without public IP | ☐ |
-| 2 | Custom domain | Bank custom domain with enterprise TLS | ☐ |
+| 2 | Custom domain | Custom domain with enterprise TLS | ☐ |
 | 3 | VNET design | Hub-spoke with Azure Firewall | ☐ |
 | 4 | Subnet sizing | /23 for control plane, /23 for workers | ☐ |
 | 5 | Pod/Service CIDR | Non-overlapping with existing networks | ☐ |
